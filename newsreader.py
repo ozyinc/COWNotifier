@@ -7,6 +7,9 @@ import json
 import requests
 import sys
 from newsparser import newsArticle
+from logger import getLogger
+
+logger = getLogger(__name__)
 
 
 class newsReader:
@@ -48,30 +51,45 @@ class newsReader:
         resp.raise_for_status()
         return resp, resp.status_code
       except requests.exceptions.RequestException as e:
-        print(
-            f"[X] Request Failed: {e} -- Endpoint: {endpoint}, Data: {params}")
+        logger.error('Request Failed: {} -- Endpoint: {}, Data: {}', e,
+                     endpoint, params)
         resp = None
         if not retry:
           return resp, e.response.status_code
-        print(f"[*] Retrying in {backoff} seconds")
+        logger.error('Retrying in {} seconds', backoff)
         time.sleep(backoff)
         backoff = max(60, backoff * 2)
       except Exception as e:
         # Something outside "requests" library failed
-        print(e, datetime.datetime.now())
+        logger.error('{} {}', e, datetime.datetime.now())
         traceback.print_exc()
         sys.exit(1)
+
+  def populateCategories(self):
+    # Grab category ids and names
+    categories = {}
+    resp, _ = self.makeAPICall('site.json', retry=True)
+    resp_categories = resp.json()['categories']
+    parent = {}
+    for item in resp_categories:
+      categories[item['id']] = item['name']
+      parent[item['id']] = item.get('parent_category_id', None)
+
+    self.categories = {}
+    for id, name in categories.items():
+      parents = [name]
+      cur_id = id
+      while parent[id] is not None:
+        parents.append(categories[parent[id]])
+        id = parent[id]
+      cat_name = '.'.join(parents[::-1])
+      logger.debug('Got category: {} - {}', cur_id, cat_name)
+      self.categories[cur_id] = cat_name
 
   def initConnection(self):
     self.updateAuthToken()
     self.time = time.time()
-
-    # Grab category ids and names
-    self.categories = {}
-    resp, _ = self.makeAPICall('site.json', retry=True)
-    resp_categories = resp.json()['categories']
-    for item in resp_categories:
-      self.categories[item['id']] = item['name']
+    self.populateCategories()
 
     # Read last stored post id
     try:
@@ -79,7 +97,7 @@ class newsReader:
         self.last_post = int(f.read().strip())
     except Exception as e:
       self.last_post = None
-      print(e, datetime.datetime.now())
+      logger.error('{} {}', e, datetime.datetime.now())
       traceback.print_exc()
 
     # Update the last stored post id
@@ -102,7 +120,7 @@ class newsReader:
       if cookie.startswith('_t='):
         self.token = {'_t': cookie[3:]}
         self.time = time.time()
-        print(f'[*] New Auth Token: {self.token} acquired at {self.time}')
+        logger.info('New Auth Token: {} acquired at {}', self.token, self.time)
         break
 
   def getIdForTopic(self, topic):
@@ -117,16 +135,21 @@ class newsReader:
   def closest(self, topic, topics=None):
     if topics == None:
       topics = self.categories.values()
+    pos = []
+    topic = topic.lower()
     for t in topics:
-      if t.lower().startswith(topic.lower()):
-        return t
-    return None
+      t_lower = t.lower()
+      if t_lower == topic.lower():
+        return [t]
+      if topic in t_lower:
+        pos.append(t)
+    return pos
 
   def updatePosts(self, mention_manager):
     if not self.initialized:
       return {}
-    # TODO: Find token expiration, 60 secs is a bit low
-    if time.time() - self.time > 60.:
+    # TODO: Find token expiration. Currently a day.
+    if time.time() - self.time > 60. * 60 * 24:
       self.updateAuthToken()
 
     # Get latest posts
@@ -161,8 +184,12 @@ class newsReader:
         start -= 1
         break
       topic = topic.json()
+      if topic['category_id'] not in self.categories:
+        logger.error('Unknown category_id: {}', topic['category_id'])
+        continue
       if topic['category_id'] not in res:
         res[topic['category_id']] = []
+      # TODO(kadircet): Also include link to the post via topic_id and post_count.
       res[topic['category_id']].append(
           newsArticle(
               (post['username'], post['name']),
@@ -170,7 +197,6 @@ class newsReader:
               topic['title'],
               (post['created_at'], self.timezone),
               post['raw'],  # raw msg (markdown)
-              post['cooked'],  # mgs in html format
               mention_manager))
     self.last_post = start
     with open(self.lfile, 'w') as f:

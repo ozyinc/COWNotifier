@@ -3,8 +3,17 @@ import json
 import datetime
 import traceback
 import queue
+import logging
+
+# TODO: Fix this mess :)
+if not os.path.exists('emoji_codepoints.py'):
+  import emoji_gen
+  emoji_gen.generateEmojiFile('emoji_codepoints.py')
 from bot import cowBot
 from server import webHook
+from logger import getLogger
+
+logger = getLogger(__name__)
 
 
 def getConf(storage):
@@ -43,9 +52,10 @@ def main():
     wh.start()
     bot.join()
   except Exception as e:
-    print(e, datetime.datetime.now())
+    logger.critical('{} {}', e, datetime.datetime.now())
     traceback.print_exc()
 
 
 if __name__ == '__main__':
+  logging.basicConfig(level=logging.INFO)
   main()

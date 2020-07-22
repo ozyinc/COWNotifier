@@ -7,9 +7,14 @@ import threading
 from database import dataBase
 from newsreader import newsReader
 from mention_manager import mentionManager
+from markdownrenderer import escape, unescape
+from logger import getLogger
+
+logger = getLogger(__name__)
 
 
 class cowBot(threading.Thread):
+  MAX_RETRIES = 3
 
   def __init__(self, conf, q):
     threading.Thread.__init__(self)
@@ -44,7 +49,7 @@ class cowBot(threading.Thread):
               if not user[1] or not msg.isPlusOne():
                 self.sendArticle(user[0], msg)
       except Exception as e:
-        print(e, datetime.datetime.now())
+        logger.error('{} {}', e, datetime.datetime.now())
         traceback.print_exc()
       time.sleep(10)
 
@@ -96,6 +101,8 @@ class cowBot(threading.Thread):
       msg = self.texts['exists'].format(added_topic)
     elif res == 2:
       msg = self.texts['notfound'].format(topic)
+    elif res == 4:
+      msg = self.texts['ambiguous'].format(added_topic)
 
     self.sendMsg(data['cid'], msg)
 
@@ -118,7 +125,7 @@ class cowBot(threading.Thread):
       self.sendMsg(data['cid'], self.texts['invalid'])
       return
 
-    topic = text[1]
+    topic = ' '.join(text[1:])
     self.db.ping()
     res, deleted_topic = self.db.deleteTopic(data['cid'], topic)
 
@@ -129,6 +136,8 @@ class cowBot(threading.Thread):
       msg = self.texts['notexists'].format(deleted_topic)
     elif res == 2:
       msg = self.texts['notfound'].format(topic)
+    elif res == 4:
+      msg = self.texts['ambiguous'].format(deleted_topic)
 
     self.sendMsg(data['cid'], msg)
 
@@ -180,33 +189,43 @@ class cowBot(threading.Thread):
       msg = "You haven't added any aliases yet."
     self.sendMsg(cid, msg)
 
-  def makeRequest(self, data):
+  def makeRequest(self, data, depth=1):
     try:
       r = requests.post(self.url, json=data)
-      print('Request:', data)
+      logger.debug('Request: {}', data)
       res = r.json()
-      if res['ok'] != True:
-        if res['error_code'] == 403 and res['description'] in (
-            'Forbidden: bot was blocked by the user',
-            'Forbidden: user is deactivated'):
-          self.db.ping()
-          self.db.setUserStatus(data['chat_id'], 0)
-        print(data, res)
-      return res['ok'] == True
+      if res['ok']:
+        return True, res
+      if res['error_code'] == 403 and res['description'] in (
+          'Forbidden: bot was blocked by the user',
+          'Forbidden: user is deactivated'):
+        logger.info('Disabling user: {}', data['chat_id'])
+        self.db.ping()
+        self.db.setUserStatus(data['chat_id'], 0)
+        return False, res
+      if res['error_code'] == 429 and depth < self.MAX_RETRIES:
+        params = res.get('parameters', {})
+        wait = params.get('retry_after')
+        if wait:
+          logger.info('Hit flood control, retrying in {} secs', wait)
+          time.sleep(wait)
+          return self.makeRequest(data, depth + 1)
+      logger.error('Req {} failed with {}', data, res)
+      return False, res
     except Exception as e:
-      print(e, datetime.datetime.now())
+      logger.error('{} {}', e, datetime.datetime.now())
       traceback.print_exc()
-    return False
+    return False, res
 
   def makeMultiPartRequest(self, files, data):
     try:
       r = requests.post(self.url, files=files, data=data)
       res = r.json()
       if res['ok'] != True:
-        print(data, res)
+        logger.error('Multi part req {} failed with {}', data, res)
       return res
     except Exception as e:
-      print(e, datetime.datetime.now())
+      logger.error('{} {}', e, datetime.datetime.now())
       traceback.print_exc()
     return False
 
@@ -219,9 +238,9 @@ class cowBot(threading.Thread):
     data['method'] = 'setWebhook'
     data['url'] = url
     files = {'certificate': open(pubkey, 'rb')}
-    resp = requests.post(self.url, data=data, files=files)
-    if resp == False:
-      print('Failed to set webhook!')
+    resp = requests.post(self.url, data=data, files=files).json()
+    if resp['ok'] == False:
+      logger.error('Failed to set webhook {} - {}', data, resp)
       sys.exit(1)
 
   def registerTexts(self):
@@ -269,6 +288,7 @@ Source is available at https://github.com/kadircet/COWNotifier
     self.texts[
         'aliasexists'] = """You already have {} as one of your aliases."""
     self.texts['noalias'] = """You forgot to provide an alias."""
+    self.texts['ambiguous'] = """Ambiguous selection: {}."""
 
   def registerHandlers(self):
     self.handlers = {
@@ -288,21 +308,33 @@ Source is available at https://github.com/kadircet/COWNotifier
     }
 
   def sendArticle(self, cid, article):
-    self.sendMsg(cid, article.getAsHtml())
+    self.sendMsg(cid, article.parse(), escaped=True)
     # TODO: Send attachments
 
-  def sendMsg(self, cid, text):
+  def sendMsg(self, cid, text, escaped=False):
     if text is None:
       return
+    if not escaped:
+      text = escape(text)
     data = {}
     data['method'] = 'sendMessage'
     data['chat_id'] = cid
-    data['parse_mode'] = 'HTML'
+    data['parse_mode'] = 'MarkdownV2'
     while len(text):
       data['text'] = text[:4096]
       text = text[4096:]
-      res = self.makeRequest(data)
-      if not res:
+      status, res = self.makeRequest(data)
+      # Failed to send message, try to recover.
+      if res.get('error_code') == 400 and res.get(
+          'description', '').startswith('Bad Request: can\'t parse entities:'):
+        data['text'] = unescape(data['text'])
+        # In case of a bad markdown syntax, try with plaintext.
+        del data['parse_mode']
+        status, _ = self.makeRequest(data)
+        # Restore parse_mode for remaining blocks.
+        data['parse_mode'] = 'MarkdownV2'
+
+      if not status:
         break
     return
 
@@ -367,7 +399,7 @@ Source is available at https://github.com/kadircet/COWNotifier
     if cmd[0] != '/':
       self.sendMsg(cid, "Master didn't make me a chatty bot!")
       return
-    cmd = cmd[1:]
+    cmd = cmd[1:].lower()
 
     if cmd not in self.handlers:
       self.sendMsg(cid, "Master didn't implement it yet!")
@@ -384,7 +416,7 @@ Source is available at https://github.com/kadircet/COWNotifier
         data = self.q.get()
         self.process(data)
       except Exception as e:
-        print(e)
+        logger.error('{}', e)
         traceback.print_exc()
       sys.stdout.flush()
       sys.stderr.flush()
